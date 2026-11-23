@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowUpRight, Bold, Check, ChevronDown, ChevronRight, Circle, ClipboardPaste, Copy, Download, Eraser, Eye, EyeOff, FilePlus2, FileUp, FolderPlus, Highlighter, ImagePlus, Italic, LassoSelect, Link2, LoaderCircle, Maximize2, Minus, MousePointer2, PenLine,
-  Lock, Plus, Redo2, RotateCcw, Save, Scissors, Search, Sparkles, Square, StickyNote, TextCursorInput, Trash2, Underline, Undo2, Unlock, X, ZoomIn, ZoomOut,
+  Lock, PanelLeftOpen, Plus, Redo2, RotateCcw, Save, Scissors, Search, SlidersHorizontal, Sparkles, Square, StickyNote, TextCursorInput, Trash2, Underline, Undo2, Unlock, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { Navigate } from 'react-router-dom'
 import { ErrorNotice, LoadingState } from '../../components/Feedback'
@@ -35,6 +35,12 @@ function lowMemoryTablet(): boolean {
 
 function addHistory(history: WhiteboardStroke[][], strokes: WhiteboardStroke[]): WhiteboardStroke[][] {
   return [...history.slice(-(historyLimit() - 1)), strokes]
+}
+
+function pointerPressure(sample: PointerEvent): number {
+  if (sample.pointerType !== 'pen') return .5
+  const pressure = Number.isFinite(sample.pressure) ? sample.pressure : 0
+  return pressure > 0 ? Math.max(.12, Math.min(1, pressure)) : .45
 }
 
 function isAnimatedImage(stroke: WhiteboardStroke): boolean {
@@ -166,6 +172,8 @@ export function WhiteboardPage() {
   const [italic, setItalic] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState<'board' | 'page' | null>(null)
   const [fitPage, setFitPage] = useState(true)
+  const [boardDrawerOpen, setBoardDrawerOpen] = useState(false)
+  const [controlsOpen, setControlsOpen] = useState(false)
   const [uploadingImage, setUploadingImage] = useState(false)
   const [uploadingCover, setUploadingCover] = useState(false)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
@@ -364,9 +372,20 @@ export function WhiteboardPage() {
     return () => { window.removeEventListener('pagehide', preserveLatestDrafts); document.removeEventListener('visibilitychange', preserveWhenHidden); preserveLatestDrafts(); if (dragPaintFrame.current) window.cancelAnimationFrame(dragPaintFrame.current) }
   }, [flushLocalStages])
 
+  function pointFromSample(target: HTMLCanvasElement, sample: PointerEvent): WhiteboardPoint {
+    const rect = target.getBoundingClientRect()
+    const width = Math.max(1, rect.width); const height = Math.max(1, rect.height)
+    return { x: Math.max(0, Math.min(BOARD_WIDTH, (sample.clientX - rect.left) * BOARD_WIDTH / width)), y: Math.max(0, Math.min(BOARD_HEIGHT, (sample.clientY - rect.top) * BOARD_HEIGHT / height)), pressure: pointerPressure(sample) }
+  }
+
   function pointFromEvent(event: React.PointerEvent<HTMLCanvasElement>): WhiteboardPoint {
-    const rect = event.currentTarget.getBoundingClientRect()
-    return { x: Math.max(0, Math.min(BOARD_WIDTH, (event.clientX - rect.left) * BOARD_WIDTH / rect.width)), y: Math.max(0, Math.min(BOARD_HEIGHT, (event.clientY - rect.top) * BOARD_HEIGHT / rect.height)), pressure: event.pressure || .5 }
+    return pointFromSample(event.currentTarget, event.nativeEvent)
+  }
+
+  function coalescedPoints(event: React.PointerEvent<HTMLCanvasElement>): WhiteboardPoint[] {
+    const native = event.nativeEvent
+    const samples = typeof native.getCoalescedEvents === 'function' ? native.getCoalescedEvents() : []
+    return (samples.length ? samples : [native]).map((sample) => pointFromSample(event.currentTarget, sample))
   }
 
   function updateBrushCursor(event: React.PointerEvent<HTMLCanvasElement>, visible = true) {
@@ -392,6 +411,9 @@ export function WhiteboardPage() {
       event.preventDefault(); void pasteSelection(pointFromEvent(event)); setPastePlacement(false); return
     }
     if (event.pointerType === 'touch') {
+      // Lenovo pens often produce a palm contact beside the active pen pointer.
+      // Keep that contact from moving the page until the pen is lifted.
+      if (activeStroke.current) return
       event.currentTarget.setPointerCapture(event.pointerId); touchPoints.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
       if (stylusOnly && touchPoints.current.size === 1) { setFitPage(false); const scroll = scrollRef.current; panGesture.current = scroll ? { x: event.clientX, y: event.clientY, left: scroll.scrollLeft, top: scroll.scrollTop } : null; return }
       if (touchPoints.current.size === 2) { const [a, b] = [...touchPoints.current.values()]; pinchDistance.current = Math.hypot(a.x - b.x, a.y - b.y); panGesture.current = null; return }
@@ -427,6 +449,7 @@ export function WhiteboardPage() {
   function continueStroke(event: React.PointerEvent<HTMLCanvasElement>) {
     updateBrushCursor(event)
     if (event.pointerType === 'touch' && touchPoints.current.has(event.pointerId)) {
+      if (activeStroke.current) return
       touchPoints.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
       if (touchPoints.current.size === 2) { const [a, b] = [...touchPoints.current.values()]; const distance = Math.hypot(a.x - b.x, a.y - b.y); if (pinchDistance.current > 0 && Math.abs(distance - pinchDistance.current) > 2) { setFitPage(false); setZoom((value) => Math.round(Math.max(25, Math.min(200, value * distance / pinchDistance.current)))); pinchDistance.current = distance } return }
       if (stylusOnly && panGesture.current && scrollRef.current) { scrollRef.current.scrollLeft = panGesture.current.left - (event.clientX - panGesture.current.x); scrollRef.current.scrollTop = panGesture.current.top - (event.clientY - panGesture.current.y); return }
@@ -469,8 +492,14 @@ export function WhiteboardPage() {
       const context = event.currentTarget.getContext('2d'); if (context && page) { context.clearRect(0, 0, BOARD_WIDTH, BOARD_HEIGHT); page.strokes.forEach((saved) => drawStroke(context, saved)); drawStroke(context, stroke) }
       return
     }
-    stroke.points.push(point)
-    const context = event.currentTarget.getContext('2d'); if (context) drawStroke(context, { ...stroke, points: [previous, point] })
+    const context = event.currentTarget.getContext('2d')
+    let last = previous
+    for (const sample of coalescedPoints(event)) {
+      if (Math.hypot(sample.x - last.x, sample.y - last.y) < .35) continue
+      stroke.points.push(sample)
+      if (context) drawStroke(context, { ...stroke, points: [last, sample] })
+      last = sample
+    }
   }
 
   function finishStroke(event: React.PointerEvent<HTMLCanvasElement>) {
@@ -745,13 +774,16 @@ export function WhiteboardPage() {
     <header className="studio-header"><div><p className="eyebrow"><Sparkles size={14} />Private study canvas</p><h1>Whiteboard</h1><p>Write, sketch and highlight school notes with your tablet pen. Boards stay private and save to your owner account.</p></div><StudioNav /></header>
     {error && <ErrorNotice message={error} />}
     <div className="whiteboard-layout">
-      <aside className="whiteboard-sidebar">
+      <aside className={`whiteboard-sidebar ${boardDrawerOpen ? 'is-open' : ''}`} aria-label="Notebook list">
         <div><strong style={{ color: board?.pages[0]?.accentColour || '#bd5d87' }}>My boards</strong><span className="board-list-actions">{board && <><button type="button" className={lockedBoardIds.has(board.id) ? 'is-active' : ''} onClick={() => setLockedBoardIds((current) => { const next = new Set(current); if (next.has(board.id)) next.delete(board.id); else next.add(board.id); return next })} title={lockedBoardIds.has(board.id) ? `Unlock ${board.title}` : `Lock ${board.title}`}>{lockedBoardIds.has(board.id) ? <Lock size={15} /> : <Unlock size={15} />}{lockedBoardIds.has(board.id) ? 'Unlock' : 'Lock'}</button><button type="button" className="danger" onClick={() => setConfirmDelete('board')} title={`Delete ${board.title}`}><Trash2 size={15} />Delete</button></>}<button type="button" onClick={() => { void addBoard() }}><Plus size={15} />New</button></span></div>
         <label className="whiteboard-board-search"><Search size={15} /><input value={boardQuery} onChange={(event) => setBoardQuery(event.target.value)} placeholder="Search my notebooks…" /></label>
-        <nav>{visibleBoards.map(({ board: candidate, depth, hasChildren, collapsed }) => <button key={candidate.id} type="button" draggable className={`${candidate.id === activeId ? 'is-active' : ''} ${candidate.id === draggedBoardId ? 'is-dragging' : ''} ${depth ? 'is-subboard' : ''} cover-${candidate.pages[0]?.coverStyle || 'blossom'}`} style={{ '--board-accent': candidate.pages[0]?.accentColour || '#bd5d87', '--board-depth': depth, '--cover-image': candidate.coverImage ? `url("${candidate.coverImage}")` : 'none' } as React.CSSProperties} onDragStart={(event) => { setDraggedBoardId(candidate.id); event.dataTransfer.setData('application/x-nya-board', JSON.stringify({ boardId: candidate.id, title: candidate.title })) }} onDragOver={(event) => event.preventDefault()} onDrop={(event) => dropOnBoard(event, candidate.id)} onDragEnd={() => setDraggedBoardId('')} onClick={() => { setActiveId(candidate.id); setActivePageId(candidate.pages[0]?.id || ''); setSelectedIds([]); setPast([]); setFuture([]) }}>{depth > 0 ? <ChevronRight className="subboard-branch" size={14} aria-hidden="true" /> : <span className="board-drag-grip" aria-hidden="true">⠿</span>}{hasChildren && <span className="board-collapse-toggle" role="button" tabIndex={0} title={collapsed ? 'Show subboards' : 'Hide subboards'} aria-label={collapsed ? `Show subboards inside ${candidate.title}` : `Hide subboards inside ${candidate.title}`} aria-expanded={!collapsed} onClick={(event) => { event.stopPropagation(); toggleBoardCollapsed(candidate.id) }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); toggleBoardCollapsed(candidate.id) } }}>{collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}</span>}<span className="board-label">{candidate.title}<small>{depth > 0 ? 'Subboard · ' : ''}{candidate.pages.length} pages · {candidate.pages.reduce((total, item) => total + item.strokes.length, 0)} marks</small></span></button>)}</nav>
+        <nav>{visibleBoards.map(({ board: candidate, depth, hasChildren, collapsed }) => <button key={candidate.id} type="button" draggable className={`${candidate.id === activeId ? 'is-active' : ''} ${candidate.id === draggedBoardId ? 'is-dragging' : ''} ${depth ? 'is-subboard' : ''} cover-${candidate.pages[0]?.coverStyle || 'blossom'}`} style={{ '--board-accent': candidate.pages[0]?.accentColour || '#bd5d87', '--board-depth': depth, '--cover-image': candidate.coverImage ? `url("${candidate.coverImage}")` : 'none' } as React.CSSProperties} onDragStart={(event) => { setDraggedBoardId(candidate.id); event.dataTransfer.setData('application/x-nya-board', JSON.stringify({ boardId: candidate.id, title: candidate.title })) }} onDragOver={(event) => event.preventDefault()} onDrop={(event) => dropOnBoard(event, candidate.id)} onDragEnd={() => setDraggedBoardId('')} onClick={() => { setActiveId(candidate.id); setActivePageId(candidate.pages[0]?.id || ''); setSelectedIds([]); setPast([]); setFuture([]); setBoardDrawerOpen(false) }}>{depth > 0 ? <ChevronRight className="subboard-branch" size={14} aria-hidden="true" /> : <span className="board-drag-grip" aria-hidden="true">⠿</span>}{hasChildren && <span className="board-collapse-toggle" role="button" tabIndex={0} title={collapsed ? 'Show subboards' : 'Hide subboards'} aria-label={collapsed ? `Show subboards inside ${candidate.title}` : `Hide subboards inside ${candidate.title}`} aria-expanded={!collapsed} onClick={(event) => { event.stopPropagation(); toggleBoardCollapsed(candidate.id) }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); toggleBoardCollapsed(candidate.id) } }}>{collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}</span>}<span className="board-label">{candidate.title}<small>{depth > 0 ? 'Subboard · ' : ''}{candidate.pages.length} pages · {candidate.pages.reduce((total, item) => total + item.strokes.length, 0)} marks</small></span></button>)}</nav>
       </aside>
-      {board && page && <section className="whiteboard-workspace">
+      <button type="button" className={`whiteboard-sidebar-backdrop ${boardDrawerOpen ? 'is-open' : ''}`} onClick={() => setBoardDrawerOpen(false)} aria-label="Close notebook list" />
+      {board && page && <section className={`whiteboard-workspace ${controlsOpen ? 'is-controls-open' : ''}`}>
         <div className="whiteboard-topbar">
+          <button type="button" className="whiteboard-drawer-toggle" onClick={() => setBoardDrawerOpen((value) => !value)} aria-expanded={boardDrawerOpen}><PanelLeftOpen size={16} />Boards</button>
+          <button type="button" className={controlsOpen ? 'whiteboard-controls-toggle is-active' : 'whiteboard-controls-toggle'} onClick={() => setControlsOpen((value) => !value)} aria-expanded={controlsOpen}><SlidersHorizontal size={16} />Controls</button>
           {parentBoard && <button type="button" className="subboard-parent-button" onClick={() => { setActiveId(parentBoard.id); setActivePageId(parentBoard.pages[0]?.id || '') }} title={`Back to ${parentBoard.title}`}><ChevronRight size={15} />{parentBoard.title}</button>}
           <input value={board.title} onChange={(event) => updateBoard({ title: event.target.value })} onBlur={() => updateBoard({ title: board.title.trim() || 'Untitled board' })} aria-label="Board title" />
           <input className="whiteboard-page-name" value={page.name} onChange={(event) => updatePage({ name: event.target.value })} onBlur={() => updatePage({ name: page.name.trim() || 'Untitled page' })} aria-label="Current page name" />
