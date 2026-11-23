@@ -1,4 +1,4 @@
-const VERSION = 'nya-offline-v6'
+const VERSION = 'nya-offline-v7'
 const SHELL = `${VERSION}-shell`
 const RUNTIME = `${VERSION}-runtime`
 const PUBLIC_DATA = `${VERSION}-public-data`

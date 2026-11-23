@@ -1,7 +1,7 @@
 import { DEFAULT_SETTINGS, DEMO_ITEMS } from './demo-data'
 import { DEMO_CALENDAR_EVENTS, DEMO_SHIFT_TEMPLATES, DEMO_STICKY_NOTES, DEMO_TASKS } from './demo-planner'
 import { DEMO_NURSING_SKILLS, DEMO_STUDY_CARDS, DEMO_STUDY_REFLECTIONS } from './demo-study'
-import { cacheWhiteboards, cachedWhiteboards, pendingWhiteboards, queueWhiteboardDelete, queueWhiteboardWrite, removePendingWhiteboard } from './offline-whiteboards'
+import { acknowledgeWhiteboard, cacheWhiteboards, cachedWhiteboards, pendingWhiteboards, queueWhiteboardDelete, queueWhiteboardWrite, removePendingWhiteboard } from './offline-whiteboards'
 import { mergeWhiteboardChanges } from './whiteboard-utils'
 import { serialiseWhiteboard } from './whiteboard-serializer'
 import type { CalendarEvent, ContentItem, ItemFilters, MediaAsset, NursingSkill, PlannerData, PlannerTask, SessionState, ShiftTemplate, SiteSettings, StickyNote, StudyCard, StudyHubData, StudyReflection, WhiteboardBoard } from '../types'
@@ -417,14 +417,12 @@ async function flushOfflineWhiteboards(): Promise<void> {
       const queuedBoard = pending.board
       const path = `/api/admin/whiteboards${pending.create ? '' : `/${queuedBoard.id}`}`
       const result = await saveRemoteWhiteboard(queuedBoard, Boolean(pending.create), path)
-      await cacheWhiteboards([result.board])
-      await removePendingWhiteboard(pending.id, queuedBoard.updatedAt)
+      await acknowledgeWhiteboard(result.board, queuedBoard.updatedAt)
     } catch (reason) {
       const queuedBoard = pending.board
       if (queuedBoard && reason instanceof ApiError && reason.status === 404 && !pending.create) {
         const result = await saveRemoteWhiteboard(queuedBoard, true, '/api/admin/whiteboards')
-        await cacheWhiteboards([result.board])
-        await removePendingWhiteboard(pending.id, queuedBoard.updatedAt)
+        await acknowledgeWhiteboard(result.board, queuedBoard.updatedAt)
         continue
       }
       throw reason
@@ -601,24 +599,23 @@ export const adminApi = {
     if (LOCAL_DEMO) { writeLocalCollection(LOCAL_REFLECTIONS_KEY, readLocalReflections().filter((reflection) => reflection.id !== id)); return { ok: true } }
     return request<{ ok: true }>(`/api/admin/reflections/${id}`, { method: 'DELETE' })
   },
-  whiteboards: async (): Promise<{ boards: WhiteboardBoard[] }> => {
+  whiteboards: async (): Promise<{ boards: WhiteboardBoard[]; queued?: boolean }> => {
     if (LOCAL_DEMO) return { boards: readLocalWhiteboards() }
     if (!navigator.onLine) {
       const cached = await cachedWhiteboards(); const pending = await pendingWhiteboards(); const merged = [...cached]
       pending.forEach(({ board, delete: deleted, id }) => { if (deleted) { const index = merged.findIndex((candidate) => candidate.id === id); if (index >= 0) merged.splice(index, 1); return }; if (!board) return; const index = merged.findIndex((candidate) => candidate.id === board.id); if (index >= 0) merged[index] = board; else merged.unshift(board) })
-      return { boards: merged }
+      return { boards: merged, queued: pending.length > 0 }
     }
     try {
       await flushOfflineWhiteboards()
       const result = await request<{ boards: WhiteboardBoard[] }>('/api/admin/whiteboards')
-      await cacheWhiteboards(result.boards, true)
-      return result
+      return await cacheWhiteboards(result.boards)
     } catch (reason) {
       const cached = await cachedWhiteboards()
       const pending = await pendingWhiteboards()
       const merged = [...cached]
       pending.forEach(({ board, delete: deleted, id }) => { if (deleted) { const index = merged.findIndex((candidate) => candidate.id === id); if (index >= 0) merged.splice(index, 1); return }; if (!board) return; const index = merged.findIndex((candidate) => candidate.id === board.id); if (index >= 0) merged[index] = board; else merged.unshift(board) })
-      if (merged.length) return { boards: merged }
+      if (merged.length || pending.length) return { boards: merged, queued: pending.length > 0 }
       throw reason
     }
   },
@@ -637,8 +634,7 @@ export const adminApi = {
     }
     try {
       const result = await saveRemoteWhiteboard(board, create)
-      await cacheWhiteboards([result.board])
-      await removePendingWhiteboard(board.id, board.updatedAt)
+      await acknowledgeWhiteboard(result.board, board.updatedAt)
       return result
     } catch (reason) {
       if (navigator.onLine && reason instanceof ApiError && reason.status > 0 && reason.status < 500) throw reason
@@ -654,17 +650,7 @@ export const adminApi = {
   syncWhiteboards: async (): Promise<{ boards: WhiteboardBoard[]; queued?: boolean }> => {
     await flushOfflineWhiteboards()
     const result = await request<{ boards: WhiteboardBoard[] }>('/api/admin/whiteboards')
-    await cacheWhiteboards(result.boards, true)
-    const pending = await pendingWhiteboards()
-    const merged = [...result.boards]
-    pending.forEach(({ board, delete: deleted, id }) => {
-      const index = merged.findIndex((candidate) => candidate.id === id)
-      if (deleted) { if (index >= 0) merged.splice(index, 1); return }
-      if (!board) return
-      if (index >= 0) merged[index] = board
-      else merged.unshift(board)
-    })
-    return { boards: merged, queued: pending.length > 0 }
+    return cacheWhiteboards(result.boards)
   },
   removeWhiteboard: async (id: string): Promise<{ ok: true }> => {
     if (LOCAL_DEMO) { writeLocalCollection(LOCAL_WHITEBOARDS_KEY, readLocalWhiteboards().filter((board) => board.id !== id)); return { ok: true } }

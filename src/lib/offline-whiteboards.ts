@@ -3,6 +3,7 @@ import type { WhiteboardBoard } from '../types'
 const DATABASE = 'nya-offline-notebooks-v1'
 const BOARDS = 'boards'
 const OUTBOX = 'outbox'
+type PendingWrite = { id: string; board?: WhiteboardBoard; create?: boolean; delete?: boolean }
 let databasePromise: Promise<IDBDatabase> | undefined
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -31,15 +32,27 @@ function transaction<T>(storeName: string, mode: IDBTransactionMode, action: (st
   }))
 }
 
-export async function cacheWhiteboards(boards: WhiteboardBoard[], replace = false): Promise<void> {
+// Read the outbox and replace the server snapshot in one transaction, so a
+// concurrent checkpoint can never be erased by a refresh.
+export async function cacheWhiteboards(boards: WhiteboardBoard[]): Promise<{ boards: WhiteboardBoard[]; queued: boolean }> {
   const database = await openDatabase()
-  await new Promise<void>((resolve, reject) => {
-    const tx = database.transaction(BOARDS, 'readwrite')
+  return new Promise((resolve, reject) => {
+    const tx = database.transaction([BOARDS, OUTBOX], 'readwrite')
     const store = tx.objectStore(BOARDS)
-    if (replace) store.clear()
-    boards.forEach((board) => store.put(board))
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
+    const read = tx.objectStore(OUTBOX).getAll()
+    let snapshot = boards
+    tx.oncomplete = () => resolve({ boards: snapshot, queued: read.result.length > 0 })
+    tx.onabort = () => reject(tx.error)
+    read.onsuccess = () => {
+      const merged = new Map(boards.map((board) => [board.id, board]))
+      for (const pending of read.result as PendingWrite[]) {
+        if (pending.delete) merged.delete(pending.id)
+        else if (pending.board) merged.set(pending.id, pending.board)
+      }
+      snapshot = [...merged.values()]
+      store.clear()
+      snapshot.forEach((board) => store.put(board))
+    }
   })
 }
 
@@ -50,11 +63,42 @@ export async function cachedWhiteboards(): Promise<WhiteboardBoard[]> {
 export async function queueWhiteboardWrite(board: WhiteboardBoard, create: boolean): Promise<void> {
   const database = await openDatabase()
   await new Promise<void>((resolve, reject) => {
-    const tx = database.transaction([BOARDS, OUTBOX], 'readwrite')
-    tx.objectStore(BOARDS).put(board)
-    tx.objectStore(OUTBOX).put({ id: board.id, board, create, delete: false })
+    const tx = database.transaction([BOARDS, OUTBOX], 'readwrite', { durability: 'strict' })
+    const outbox = tx.objectStore(OUTBOX)
+    const read = outbox.get(board.id)
+    read.onsuccess = () => {
+      const pending = read.result as PendingWrite | undefined
+      if (pending?.delete || (pending?.board && pending.board.updatedAt > board.updatedAt)) return
+      tx.objectStore(BOARDS).put(board)
+      outbox.put({ id: board.id, board, create: create || pending?.create, delete: false })
+    }
     tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
+    tx.onabort = () => reject(tx.error)
+  })
+}
+
+export async function acknowledgeWhiteboard(board: WhiteboardBoard, expectedUpdatedAt: string): Promise<void> {
+  const database = await openDatabase()
+  await new Promise<void>((resolve, reject) => {
+    const tx = database.transaction([BOARDS, OUTBOX], 'readwrite')
+    const outbox = tx.objectStore(OUTBOX)
+    const read = outbox.get(board.id)
+    read.onsuccess = () => {
+      const pending = read.result as PendingWrite | undefined
+      const cached = tx.objectStore(BOARDS)
+      if (pending && (pending.delete || pending.board?.updatedAt !== expectedUpdatedAt)) {
+        if (pending.create && !pending.delete) outbox.put({ ...pending, create: false })
+        return
+      }
+      const previous = cached.get(board.id)
+      previous.onsuccess = () => {
+        if (!pending && previous.result?.revision > (board.revision || 0)) return
+        cached.put(board)
+        outbox.delete(board.id)
+      }
+    }
+    tx.oncomplete = () => resolve()
+    tx.onabort = () => reject(tx.error)
   })
 }
 
