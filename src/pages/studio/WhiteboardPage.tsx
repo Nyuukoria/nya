@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowUpRight, Bold, Check, ChevronDown, ChevronRight, Circle, ClipboardPaste, Copy, Download, Eraser, Eye, EyeOff, FilePlus2, FileUp, FolderPlus, Highlighter, ImagePlus, Italic, LassoSelect, Link2, LoaderCircle, Maximize2, Minus, MousePointer2, PenLine,
   Lock, PanelLeftOpen, Plus, Redo2, RotateCcw, Save, Scissors, Search, SlidersHorizontal, Sparkles, Square, StickyNote, TextCursorInput, Trash2, Underline, Undo2, Unlock, X, ZoomIn, ZoomOut,
@@ -139,6 +139,7 @@ export function WhiteboardPage() {
   const paperRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const activeStroke = useRef<WhiteboardStroke | null>(null)
+  const drawingPointer = useRef<number | null>(null)
   const saveQueue = useRef<Promise<unknown>>(Promise.resolve())
   const pendingSaves = useRef(new Map<string, WhiteboardBoard>())
   const pendingLocalStages = useRef(new Map<string, WhiteboardBoard>())
@@ -163,6 +164,7 @@ export function WhiteboardPage() {
   const [markerSize, setMarkerSize] = useState(28)
   const [markerOpacity, setMarkerOpacity] = useState(30)
   const [zoom, setZoom] = useState(70)
+  const [viewport, setViewport] = useState({ width: 0, height: 0 })
   const [stylusOnly, setStylusOnly] = useState(true)
   const [paperScale, setPaperScale] = useState({ x: 1, y: 1 })
   const [fontFamily, setFontFamily] = useState<NonNullable<WhiteboardStroke['fontFamily']>>('handwritten')
@@ -184,9 +186,10 @@ export function WhiteboardPage() {
   const drag = useRef<{ ids: string[]; start: WhiteboardPoint; originals: Map<string, WhiteboardPoint[]>; latestStrokes: WhiteboardStroke[] } | null>(null)
   const activeLasso = useRef<WhiteboardPoint[] | null>(null)
   const touchPoints = useRef(new Map<number, { x: number; y: number }>())
-  const pinchDistance = useRef(0)
+  const pinch = useRef<{ distance: number; zoom: number; x: number; y: number } | null>(null)
+  const zoomAnchor = useRef<{ x: number; y: number; clientX: number; clientY: number } | null>(null)
+  const gestureFrame = useRef(0)
   const panGesture = useRef<{ x: number; y: number; left: number; top: number } | null>(null)
-  const swipeStart = useRef<{ x: number; y: number } | null>(null)
   const [past, setPast] = useState<WhiteboardStroke[][]>([])
   const [future, setFuture] = useState<WhiteboardStroke[][]>([])
   const [draggedBoardId, setDraggedBoardId] = useState('')
@@ -202,8 +205,45 @@ export function WhiteboardPage() {
   const selectedText = page ? selectedWhiteboardText(page.strokes, selectedIds) : ''
   const activeColour = tool === 'highlighter' ? markerColour : colour
   const paperFactor = (page?.paperSize === 'a3' ? 1.414 : page?.paperSize === 'letter' ? .97 : 1) * ((page?.pageScale || 100) / 100)
-  const displayWidth = (page?.orientation === 'landscape' ? BOARD_HEIGHT : BOARD_WIDTH) * paperFactor * zoom / 100
-  const displayHeight = (page?.orientation === 'landscape' ? BOARD_WIDTH : BOARD_HEIGHT) * paperFactor * zoom / 100
+  const paperWidth = (page?.orientation === 'landscape' ? BOARD_HEIGHT : BOARD_WIDTH) * paperFactor
+  const paperHeight = (page?.orientation === 'landscape' ? BOARD_WIDTH : BOARD_HEIGHT) * paperFactor
+  const fittedZoom = viewport.width ? 100 * Math.min(viewport.width / paperWidth, viewport.height / paperHeight) : zoom
+  const effectiveZoom = fitPage ? fittedZoom : zoom
+  const displayWidth = paperWidth * effectiveZoom / 100
+  const displayHeight = paperHeight * effectiveZoom / 100
+  const hasPage = Boolean(page)
+
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current
+    if (!scroll) return
+    const measure = () => {
+      const width = scroll.clientWidth, height = scroll.clientHeight
+      setViewport((current) => current.width === width && current.height === height ? current : { width, height })
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(scroll)
+    return () => observer.disconnect()
+  }, [hasPage])
+
+  function restoreZoomAnchor() {
+    const anchor = zoomAnchor.current, scroll = scrollRef.current, paper = paperRef.current
+    if (!anchor || !scroll || !paper) return
+    const rect = paper.getBoundingClientRect()
+    scroll.scrollLeft += rect.left + rect.width * anchor.x - anchor.clientX
+    scroll.scrollTop += rect.top + rect.height * anchor.y - anchor.clientY
+  }
+  useLayoutEffect(restoreZoomAnchor, [displayWidth, displayHeight, fitPage])
+
+  function changeZoom(value: number) {
+    const scroll = scrollRef.current, paper = paperRef.current
+    if (scroll && paper) {
+      const rect = paper.getBoundingClientRect(), view = scroll.getBoundingClientRect()
+      const clientX = view.left + scroll.clientWidth / 2, clientY = view.top + scroll.clientHeight / 2
+      zoomAnchor.current = { clientX, clientY, x: (clientX - rect.left) / rect.width, y: (clientY - rect.top) / rect.height }
+    }
+    setFitPage(false); setZoom(Math.max(1, Math.min(200, value)))
+  }
 
   useEffect(() => { boardsRef.current = boards }, [boards])
 
@@ -225,20 +265,27 @@ export function WhiteboardPage() {
   }, [lockedBoardIds])
 
   useEffect(() => {
-    const savedOffline = () => {
-      // An older network request may finish after newer pen strokes were queued.
-      // Never let that stale result claim the newest draft is already durable.
-      if (!pendingLocalStages.current.size) setSaveState('offline')
+    const sync = () => {
+      const version = saveVersion.current
+      saveQueue.current = saveQueue.current.catch(() => undefined).then(async () => {
+        if (pendingSaves.current.size || pendingLocalStages.current.size) return
+        const { boards: synced, queued } = await adminApi.syncWhiteboards()
+        if (version !== saveVersion.current || activeStroke.current || drag.current || activeLasso.current) return
+        synced.forEach((candidate) => savedRevisions.current.set(candidate.id, candidate.revision || 1))
+        boardsRef.current = synced; setBoards(synced)
+        setActiveId((current) => synced.some((candidate) => candidate.id === current) ? current : synced[0]?.id || '')
+        setActivePageId((current) => synced.some((candidate) => candidate.pages.some((item) => item.id === current)) ? current : synced[0]?.pages[0]?.id || '')
+        setSaveState(queued ? 'offline' : 'saved'); setError('')
+      }).catch((reason) => { if (version === saveVersion.current) setError(reason instanceof Error ? reason.message : 'Offline pages could not sync yet.') })
     }
-    const sync = () => { setSaveState('saving'); adminApi.syncWhiteboards().then(({ boards: synced, queued }) => { synced.forEach((candidate) => savedRevisions.current.set(candidate.id, candidate.revision || 1)); boardsRef.current = synced; setBoards(synced); setActiveId((current) => synced.some((candidate) => candidate.id === current) ? current : synced[0]?.id || ''); setActivePageId((current) => synced.some((candidate) => candidate.pages.some((item) => item.id === current)) ? current : synced[0]?.pages[0]?.id || ''); setSaveState(queued ? 'offline' : 'saved'); setError('') }).catch((reason) => { setSaveState('unsaved'); setError(reason instanceof Error ? reason.message : 'Offline pages could not sync yet.') }) }
-    window.addEventListener('nya-offline-save', savedOffline)
     window.addEventListener('online', sync)
-    return () => { window.removeEventListener('nya-offline-save', savedOffline); window.removeEventListener('online', sync) }
+    return () => { window.removeEventListener('online', sync); cancelAnimationFrame(gestureFrame.current) }
   }, [])
 
   useEffect(() => {
     if (!session?.authenticated) return
-    adminApi.whiteboards().then(async ({ boards: loaded }) => {
+    adminApi.whiteboards().then(async ({ boards: loaded, queued }) => {
+      if (queued) setSaveState('offline')
       if (loaded.length) {
         loaded.forEach((candidate) => savedRevisions.current.set(candidate.id, candidate.revision || 1))
         let rememberedBoard = ''; let rememberedPage = ''
@@ -281,13 +328,13 @@ export function WhiteboardPage() {
 
   useEffect(() => {
     const paper = paperRef.current
-    if (!paper) return
+    if (!paper || !editor) return
     const updateScale = () => { const rect = paper.getBoundingClientRect(); setPaperScale({ x: rect.width / BOARD_WIDTH, y: rect.height / BOARD_HEIGHT }) }
     updateScale()
     const observer = new ResizeObserver(updateScale)
     observer.observe(paper)
     return () => observer.disconnect()
-  }, [page?.id, page?.orientation, page?.paperSize, page?.pageScale, zoom, fitPage])
+  }, [page?.id, Boolean(editor)])
 
   const flushLocalStages = useCallback((): Promise<void> => {
     if (localStageTimer.current) window.clearTimeout(localStageTimer.current)
@@ -325,9 +372,13 @@ export function WhiteboardPage() {
     }
     if (saveTimer.current) window.clearTimeout(saveTimer.current)
     saveTimer.current = window.setTimeout(() => {
-      const batch = [...pendingSaves.current.values()]
-      pendingSaves.current.clear()
+      let batch: WhiteboardBoard[] = []
+      let sendingVersion = version
       saveQueue.current = saveQueue.current.catch(() => undefined).then(async () => {
+        batch = [...pendingSaves.current.values()]
+        if (!batch.length) return undefined
+        sendingVersion = saveVersion.current
+        pendingSaves.current.clear()
         await flushLocalStages().catch(() => undefined)
         let queuedOnDevice = false
         for (const candidate of batch) {
@@ -345,10 +396,10 @@ export function WhiteboardPage() {
         }
         return queuedOnDevice
       }).then((queuedOnDevice) => {
-        if (version === saveVersion.current && pendingSaves.current.size === 0) { setSaveState(queuedOnDevice ? 'offline' : 'saved'); setError('') }
+        if (queuedOnDevice !== undefined && sendingVersion === saveVersion.current && pendingSaves.current.size === 0) { setSaveState(queuedOnDevice ? 'offline' : 'saved'); setError('') }
       }).catch((reason) => {
         batch.forEach((candidate) => { if (!pendingSaves.current.has(candidate.id)) pendingSaves.current.set(candidate.id, candidate) })
-        if (version === saveVersion.current) setSaveState('unsaved')
+        if (sendingVersion === saveVersion.current) setSaveState('unsaved')
         setError(reason instanceof Error ? reason.message : 'The board could not be saved.')
       })
     }, lowMemoryTablet() ? 2_400 : 1_400)
@@ -365,27 +416,27 @@ export function WhiteboardPage() {
   }, [saveBoard])
 
   useEffect(() => {
-    const preserveLatestDrafts = () => { pendingSaves.current.forEach((candidate) => pendingLocalStages.current.set(candidate.id, candidate)); void flushLocalStages() }
+    const preserveLatestDrafts = () => { void flushLocalStages().catch(() => undefined) }
     const preserveWhenHidden = () => { if (document.visibilityState === 'hidden') preserveLatestDrafts() }
     window.addEventListener('pagehide', preserveLatestDrafts)
     document.addEventListener('visibilitychange', preserveWhenHidden)
     return () => { window.removeEventListener('pagehide', preserveLatestDrafts); document.removeEventListener('visibilitychange', preserveWhenHidden); preserveLatestDrafts(); if (dragPaintFrame.current) window.cancelAnimationFrame(dragPaintFrame.current) }
   }, [flushLocalStages])
 
-  function pointFromSample(target: HTMLCanvasElement, sample: PointerEvent): WhiteboardPoint {
-    const rect = target.getBoundingClientRect()
+  function pointFromSample(rect: DOMRect, sample: PointerEvent): WhiteboardPoint {
     const width = Math.max(1, rect.width); const height = Math.max(1, rect.height)
     return { x: Math.max(0, Math.min(BOARD_WIDTH, (sample.clientX - rect.left) * BOARD_WIDTH / width)), y: Math.max(0, Math.min(BOARD_HEIGHT, (sample.clientY - rect.top) * BOARD_HEIGHT / height)), pressure: pointerPressure(sample) }
   }
 
   function pointFromEvent(event: React.PointerEvent<HTMLCanvasElement>): WhiteboardPoint {
-    return pointFromSample(event.currentTarget, event.nativeEvent)
+    return pointFromSample(event.currentTarget.getBoundingClientRect(), event.nativeEvent)
   }
 
   function coalescedPoints(event: React.PointerEvent<HTMLCanvasElement>): WhiteboardPoint[] {
     const native = event.nativeEvent
     const samples = typeof native.getCoalescedEvents === 'function' ? native.getCoalescedEvents() : []
-    return (samples.length ? samples : [native]).map((sample) => pointFromSample(event.currentTarget, sample))
+    const rect = event.currentTarget.getBoundingClientRect()
+    return (samples.length ? samples : [native]).map((sample) => pointFromSample(rect, sample))
   }
 
   function updateBrushCursor(event: React.PointerEvent<HTMLCanvasElement>, visible = true) {
@@ -407,21 +458,28 @@ export function WhiteboardPage() {
 
   function beginStroke(event: React.PointerEvent<HTMLCanvasElement>) {
     if (!board || !page || (stylusOnly && event.pointerType !== 'pen' && event.pointerType !== 'touch')) return
+    if (drawingPointer.current !== null) return
     if (pastePlacement) {
       event.preventDefault(); void pasteSelection(pointFromEvent(event)); setPastePlacement(false); return
     }
     if (event.pointerType === 'touch') {
       // Lenovo pens often produce a palm contact beside the active pen pointer.
       // Keep that contact from moving the page until the pen is lifted.
-      if (activeStroke.current) return
+      if (activeStroke.current || drag.current || activeLasso.current) return
       event.currentTarget.setPointerCapture(event.pointerId); touchPoints.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
-      if (stylusOnly && touchPoints.current.size === 1) { setFitPage(false); const scroll = scrollRef.current; panGesture.current = scroll ? { x: event.clientX, y: event.clientY, left: scroll.scrollLeft, top: scroll.scrollTop } : null; return }
-      if (touchPoints.current.size === 2) { const [a, b] = [...touchPoints.current.values()]; pinchDistance.current = Math.hypot(a.x - b.x, a.y - b.y); panGesture.current = null; return }
+      if (stylusOnly && touchPoints.current.size === 1) { const scroll = scrollRef.current; panGesture.current = scroll ? { x: event.clientX, y: event.clientY, left: scroll.scrollLeft, top: scroll.scrollTop } : null; return }
+      if (touchPoints.current.size === 2) {
+        const [a, b] = [...touchPoints.current.values()]
+        const rect = event.currentTarget.getBoundingClientRect()
+        pinch.current = { distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), zoom: effectiveZoom, x: ((a.x + b.x) / 2 - rect.left) / rect.width, y: ((a.y + b.y) / 2 - rect.top) / rect.height }
+        panGesture.current = null; return
+      }
       if (stylusOnly) return
     }
     const point = pointFromEvent(event)
     if (tool === 'text' || tool === 'note') { setEditor({ kind: tool, point, value: '' }); setSelectedIds([]); return }
     if (tool === 'lasso') {
+      drawingPointer.current = event.pointerId
       event.currentTarget.setPointerCapture(event.pointerId); activeLasso.current = [point]; clearLassoCanvas(); setSelectedIds([]); return
     }
     if (tool === 'select') {
@@ -433,6 +491,7 @@ export function WhiteboardPage() {
       const ids = hit ? selectionWithEraserMasks(page.strokes, selectedIds.includes(hit.id) ? selectedIds : [hit.id]) : []
       setSelectedIds(ids)
       if (hit) {
+        drawingPointer.current = event.pointerId
         event.currentTarget.setPointerCapture(event.pointerId)
         const selectedSet = new Set(ids)
         drag.current = { ids, start: point, originals: new Map(page.strokes.filter((stroke) => selectedSet.has(stroke.id)).map((stroke) => [stroke.id, stroke.points.map((item) => ({ ...item }))])), latestStrokes: page.strokes }
@@ -441,20 +500,42 @@ export function WhiteboardPage() {
       return
     }
     event.currentTarget.setPointerCapture(event.pointerId)
+    drawingPointer.current = event.pointerId
     const stroke: WhiteboardStroke = { id: newId('stroke'), tool, colour: activeColour, size: tool === 'highlighter' ? markerSize : tool === 'eraser' ? Math.max(18, size * 2.5) : size, opacity: tool === 'highlighter' ? markerOpacity / 100 : undefined, points: [point], updatedAt: new Date().toISOString() }
     activeStroke.current = stroke
     const context = event.currentTarget.getContext('2d'); if (context) drawStroke(context, stroke)
   }
 
   function continueStroke(event: React.PointerEvent<HTMLCanvasElement>) {
-    updateBrushCursor(event)
     if (event.pointerType === 'touch' && touchPoints.current.has(event.pointerId)) {
-      if (activeStroke.current) return
       touchPoints.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
-      if (touchPoints.current.size === 2) { const [a, b] = [...touchPoints.current.values()]; const distance = Math.hypot(a.x - b.x, a.y - b.y); if (pinchDistance.current > 0 && Math.abs(distance - pinchDistance.current) > 2) { setFitPage(false); setZoom((value) => Math.round(Math.max(25, Math.min(200, value * distance / pinchDistance.current)))); pinchDistance.current = distance } return }
-      if (stylusOnly && panGesture.current && scrollRef.current) { scrollRef.current.scrollLeft = panGesture.current.left - (event.clientX - panGesture.current.x); scrollRef.current.scrollTop = panGesture.current.top - (event.clientY - panGesture.current.y); return }
+      if (pinch.current && touchPoints.current.size >= 2) {
+        if (!gestureFrame.current) gestureFrame.current = requestAnimationFrame(() => {
+          gestureFrame.current = 0
+          const start = pinch.current, [a, b] = touchPoints.current.values()
+          if (!start || !a || !b) return
+          zoomAnchor.current = { x: start.x, y: start.y, clientX: (a.x + b.x) / 2, clientY: (a.y + b.y) / 2 }
+          const target = Math.min(200, Math.max(Math.min(10, start.zoom), start.zoom * Math.hypot(a.x - b.x, a.y - b.y) / start.distance))
+          restoreZoomAnchor()
+          setFitPage(false); setZoom(target)
+        })
+        return
+      }
+      if (stylusOnly && panGesture.current && scrollRef.current) {
+        const scroll = scrollRef.current, previous = panGesture.current
+        const dx = previous.x - event.clientX, dy = previous.y - event.clientY
+        scroll.scrollLeft = previous.left + dx
+        scroll.scrollTop = previous.top + dy
+        const remainingY = previous.top + dy - scroll.scrollTop
+        if (Math.abs(dy) > Math.abs(dx) && Math.abs(remainingY) >= 1) window.scrollBy(0, remainingY)
+        panGesture.current = { x: event.clientX, y: event.clientY, left: scroll.scrollLeft, top: scroll.scrollTop }
+        return
+      }
       if (stylusOnly) return
     }
+    if (event.pointerType === 'touch' && stylusOnly) return
+    updateBrushCursor(event)
+    if (drawingPointer.current !== event.pointerId) return
     if (activeLasso.current) {
       const point = pointFromEvent(event); const previous = activeLasso.current[activeLasso.current.length - 1]
       if (Math.hypot(point.x - previous.x, point.y - previous.y) < 3) return
@@ -503,7 +584,16 @@ export function WhiteboardPage() {
   }
 
   function finishStroke(event: React.PointerEvent<HTMLCanvasElement>) {
-    touchPoints.current.delete(event.pointerId); if (event.pointerType === 'touch' && event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); if (touchPoints.current.size < 2) pinchDistance.current = 0; if (!touchPoints.current.size) panGesture.current = null; else if (stylusOnly && touchPoints.current.size === 1 && scrollRef.current) { const remaining = [...touchPoints.current.values()][0]; panGesture.current = { x: remaining.x, y: remaining.y, left: scrollRef.current.scrollLeft, top: scrollRef.current.scrollTop } }
+    if (event.pointerType === 'touch') {
+      touchPoints.current.delete(event.pointerId)
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+      if (touchPoints.current.size < 2) { pinch.current = null; cancelAnimationFrame(gestureFrame.current); gestureFrame.current = 0 }
+      const [remaining] = touchPoints.current.values(), scroll = scrollRef.current
+      panGesture.current = stylusOnly && remaining && scroll ? { x: remaining.x, y: remaining.y, left: scroll.scrollLeft, top: scroll.scrollTop } : null
+      if (stylusOnly) return
+    }
+    if (drawingPointer.current !== event.pointerId) return
+    drawingPointer.current = null
     if (activeLasso.current) {
       const rawPolygon = activeLasso.current; const step = Math.max(1, Math.ceil(rawPolygon.length / 500)); const polygon = rawPolygon.filter((_, index) => index % step === 0 || index === rawPolygon.length - 1); activeLasso.current = null; clearLassoCanvas()
       if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
@@ -712,7 +802,6 @@ export function WhiteboardPage() {
     commitBoard(next); setActivePageId(pages[0].id); setPast([]); setFuture([])
   }
 
-  function turnPage(direction: number) { if (!board || !page) return; const index = board.pages.findIndex((item) => item.id === page.id); const next = index + direction; if (next >= 0 && next < board.pages.length) { setActivePageId(board.pages[next].id); setSelectedIds([]); setPast([]); setFuture([]) } }
 
   function exportPng() {
     if (!board || !page) return
@@ -809,9 +898,9 @@ export function WhiteboardPage() {
           <select value={page.orientation || 'portrait'} onChange={(event) => updatePage({ orientation: event.target.value as WhiteboardPageData['orientation'] })} aria-label="Paper orientation"><option value="portrait">Portrait</option><option value="landscape">Landscape</option></select>
           <label className="ruling-size">Spacing <input type="range" min="10" max="140" step="1" value={page.rulingSize || 20} onChange={(event) => updatePage({ rulingSize: Number(event.target.value) })} aria-label="Paper line spacing slider" /><input className="precise-number" type="number" min="10" max="140" step="1" value={page.rulingSize || 20} onChange={(event) => updatePage({ rulingSize: Math.max(10, Math.min(140, Number(event.target.value) || 10)) })} aria-label="Exact paper line spacing" /><span>px</span></label>
           <label className="stylus-toggle"><input type="checkbox" checked={stylusOnly} onChange={(event) => setStylusOnly(event.target.checked)} /><MousePointer2 size={15} />Stylus only</label>
-          <div className="zoom-control"><button type="button" className={fitPage ? 'is-active' : ''} onClick={() => setFitPage((value) => !value)} title="Fit the complete page"><Maximize2 size={16} /></button><button type="button" onClick={() => { setFitPage(false); setZoom((value) => Math.max(25, value - 1)) }} title="Zoom out 1%"><ZoomOut size={16} /></button><input type="range" min="25" max="200" step="1" value={zoom} onChange={(event) => { setFitPage(false); setZoom(Number(event.target.value)) }} aria-label="Page zoom slider" /><input className="precise-number" type="number" min="25" max="200" step="1" value={zoom} onChange={(event) => { setFitPage(false); setZoom(Math.max(25, Math.min(200, Number(event.target.value) || 25))) }} aria-label="Exact page zoom" /><span>%</span><button type="button" onClick={() => { setFitPage(false); setZoom((value) => Math.min(200, value + 1)) }} title="Zoom in 1%"><ZoomIn size={16} /></button></div>
+          <div className="zoom-control"><button type="button" className={fitPage ? 'is-active' : ''} onClick={() => { zoomAnchor.current = null; setFitPage(true) }} title="Fit the complete page"><Maximize2 size={16} /></button><button type="button" onClick={() => changeZoom(effectiveZoom / 1.15)} title="Zoom out"><ZoomOut size={16} /></button><input type="range" min="1" max="200" step="1" value={Math.round(effectiveZoom)} onChange={(event) => changeZoom(Number(event.target.value))} aria-label="Page zoom slider" /><input className="precise-number" type="number" min="1" max="200" step="1" value={Math.round(effectiveZoom)} onChange={(event) => { if (event.target.valueAsNumber > 0) changeZoom(event.target.valueAsNumber) }} aria-label="Exact page zoom" /><span>%</span><button type="button" onClick={() => changeZoom(effectiveZoom * 1.15)} title="Zoom in"><ZoomIn size={16} /></button></div>
         </div>
-        <div ref={scrollRef} className={`whiteboard-scroll ${fitPage ? 'is-fit' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={dropOnPage} onTouchStart={(event) => { if (tool === 'select' && event.touches.length === 1) swipeStart.current = { x: event.touches[0].clientX, y: event.touches[0].clientY } }} onTouchEnd={(event) => { if (!swipeStart.current || !event.changedTouches[0]) return; const dx = event.changedTouches[0].clientX - swipeStart.current.x; const dy = event.changedTouches[0].clientY - swipeStart.current.y; if (Math.abs(dx) > 80 && Math.abs(dx) > Math.abs(dy) * 1.4) turnPage(dx < 0 ? 1 : -1); swipeStart.current = null }}><div ref={paperRef} className={`whiteboard-paper size-${page.paperSize || 'a4'} orientation-${page.orientation || 'portrait'} background-${page.background}`} style={{ width: `${displayWidth}px`, height: `${displayHeight}px`, '--ruling-x': `${(page.rulingSize || 20) / BOARD_WIDTH * 100}%`, '--ruling-y': `${(page.rulingSize || 20) / BOARD_HEIGHT * 100}%` } as React.CSSProperties}><canvas ref={canvasRef} width={BOARD_WIDTH} height={BOARD_HEIGHT} onPointerDown={beginStroke} onPointerMove={continueStroke} onPointerUp={finishStroke} onPointerCancel={finishStroke} onPointerEnter={(event) => updateBrushCursor(event)} onPointerLeave={(event) => updateBrushCursor(event, false)} />{page.strokes.filter((stroke) => isAnimatedImage(stroke) && stroke.points[0]).map((stroke) => <img key={`live-${stroke.id}`} className="whiteboard-live-gif" src={reliableWhiteboardMediaUrl(stroke.imageUrl || '')} alt="" style={{ left: `${stroke.points[0].x / BOARD_WIDTH * 100}%`, top: `${stroke.points[0].y / BOARD_HEIGHT * 100}%`, width: `${(stroke.width || 420) / BOARD_WIDTH * 100}%`, height: `${(stroke.height || 300) / BOARD_HEIGHT * 100}%` }} />)}<canvas ref={lassoCanvasRef} className="whiteboard-lasso-layer" width={tool === 'lasso' ? BOARD_WIDTH : 1} height={tool === 'lasso' ? BOARD_HEIGHT : 1} aria-hidden="true" /><div ref={brushCursorRef} className={`whiteboard-brush-cursor is-${tool}`} aria-hidden="true" />{editor && <><textarea autoFocus className={`whiteboard-inline-editor ${editor.kind === 'note' ? 'is-note' : ''}`} style={{ left: `${editor.point.x / BOARD_WIDTH * 100}%`, top: `${editor.point.y / BOARD_HEIGHT * 100}%`, width: `${(editor.kind === 'note' ? 320 : Math.min(600, BOARD_WIDTH - editor.point.x - 20)) * paperScale.y}px`, minHeight: `${(editor.kind === 'note' ? 230 : Math.max(70, fontSize * 2.7)) * paperScale.y}px`, padding: editor.kind === 'note' ? `${24 * paperScale.y}px` : '0', fontFamily: fontFamilies[fontFamily], fontSize: `${fontSize * paperScale.y}px`, lineHeight: 1.25, transform: `scaleX(${paperScale.x / Math.max(.001, paperScale.y)})`, transformOrigin: 'top left' }} value={editor.value} onChange={(event) => setEditor({ ...editor, value: event.target.value })} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') commitEditor(); if (event.key === 'Escape') setEditor(null) }} placeholder={editor.kind === 'note' ? 'Write a little note…' : 'Type directly on the page…'} /><div className="whiteboard-inline-actions" style={{ left: `${editor.point.x / BOARD_WIDTH * 100}%`, top: `${editor.point.y / BOARD_HEIGHT * 100}%` }}><button type="button" onClick={commitEditor}><Check size={14} />Place</button><button type="button" onClick={() => setEditor(null)}><X size={14} /></button></div></>}</div></div>
+        <div ref={scrollRef} className={`whiteboard-scroll ${fitPage ? 'is-fit' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={dropOnPage}><div ref={paperRef} className={`whiteboard-paper size-${page.paperSize || 'a4'} orientation-${page.orientation || 'portrait'} background-${page.background}`} style={{ width: `${displayWidth}px`, height: `${displayHeight}px`, '--ruling-x': `${(page.rulingSize || 20) / BOARD_WIDTH * 100}%`, '--ruling-y': `${(page.rulingSize || 20) / BOARD_HEIGHT * 100}%` } as React.CSSProperties}><canvas ref={canvasRef} width={BOARD_WIDTH} height={BOARD_HEIGHT} onPointerDown={beginStroke} onPointerMove={continueStroke} onPointerUp={finishStroke} onPointerCancel={finishStroke} onPointerEnter={(event) => updateBrushCursor(event)} onPointerLeave={(event) => updateBrushCursor(event, false)} />{page.strokes.filter((stroke) => isAnimatedImage(stroke) && stroke.points[0]).map((stroke) => <img key={`live-${stroke.id}`} className="whiteboard-live-gif" src={reliableWhiteboardMediaUrl(stroke.imageUrl || '')} alt="" style={{ left: `${stroke.points[0].x / BOARD_WIDTH * 100}%`, top: `${stroke.points[0].y / BOARD_HEIGHT * 100}%`, width: `${(stroke.width || 420) / BOARD_WIDTH * 100}%`, height: `${(stroke.height || 300) / BOARD_HEIGHT * 100}%` }} />)}<canvas ref={lassoCanvasRef} className="whiteboard-lasso-layer" width={tool === 'lasso' ? BOARD_WIDTH : 1} height={tool === 'lasso' ? BOARD_HEIGHT : 1} aria-hidden="true" /><div ref={brushCursorRef} className={`whiteboard-brush-cursor is-${tool}`} aria-hidden="true" />{editor && <><textarea autoFocus className={`whiteboard-inline-editor ${editor.kind === 'note' ? 'is-note' : ''}`} style={{ left: `${editor.point.x / BOARD_WIDTH * 100}%`, top: `${editor.point.y / BOARD_HEIGHT * 100}%`, width: `${(editor.kind === 'note' ? 320 : Math.min(600, BOARD_WIDTH - editor.point.x - 20)) * paperScale.y}px`, minHeight: `${(editor.kind === 'note' ? 230 : Math.max(70, fontSize * 2.7)) * paperScale.y}px`, padding: editor.kind === 'note' ? `${24 * paperScale.y}px` : '0', fontFamily: fontFamilies[fontFamily], fontSize: `${fontSize * paperScale.y}px`, lineHeight: 1.25, transform: `scaleX(${paperScale.x / Math.max(.001, paperScale.y)})`, transformOrigin: 'top left' }} value={editor.value} onChange={(event) => setEditor({ ...editor, value: event.target.value })} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') commitEditor(); if (event.key === 'Escape') setEditor(null) }} placeholder={editor.kind === 'note' ? 'Write a little note…' : 'Type directly on the page…'} /><div className="whiteboard-inline-actions" style={{ left: `${editor.point.x / BOARD_WIDTH * 100}%`, top: `${editor.point.y / BOARD_HEIGHT * 100}%` }}><button type="button" onClick={commitEditor}><Check size={14} />Place</button><button type="button" onClick={() => setEditor(null)}><X size={14} /></button></div></>}</div></div>
         <p className="whiteboard-tip"><RotateCcw size={14} />With <strong>Stylus only</strong>, draw with the pen, drag the paper in any direction with one finger, and pinch with two fingers to zoom.</p>
       </section>}
       {confirmDelete && <div className="whiteboard-dialog-backdrop" role="presentation" onMouseDown={() => setConfirmDelete(null)}><section className="whiteboard-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-dialog-title" onMouseDown={(event) => event.stopPropagation()}><h2 id="delete-dialog-title">Delete {confirmDelete === 'board' ? 'notebook' : 'page'}?</h2><p>{confirmDelete === 'board' ? `“${board?.title}” and all its pages will be permanently removed.` : `“${page?.name}” will be permanently removed.`}</p><div><button type="button" onClick={() => setConfirmDelete(null)}>Keep it</button><button type="button" className="danger" onClick={() => { const action = confirmDelete; setConfirmDelete(null); if (action === 'board') void deleteBoard(); else deletePage() }}><Trash2 size={15} />Delete</button></div></section></div>}
