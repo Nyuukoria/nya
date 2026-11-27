@@ -67,6 +67,6 @@ This project will grow alongside the nursing training: new school work, practica
 
 ## Ownership
 
-Copyright © 2026 Sasutendo. All rights reserved.
+Copyright © 2026 Nyuukoria. All rights reserved.
 
 The source is publicly visible for viewing and sharing only. See [LICENSE](LICENSE) for the complete terms.
